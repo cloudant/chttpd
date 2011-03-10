@@ -345,7 +345,6 @@ view_group_etag(Group, Db) ->
     view_group_etag(Group, Db, nil).
 
 view_group_etag(#group{sig=Sig,current_seq=CurrentSeq}, _Db, Extra) ->
-    % ?LOG_ERROR("Group ~p",[Group]),
     % This is not as granular as it could be.
     % If there are updates to the db that do not effect the view index,
     % they will change the Etag. For more granular Etags we'd need to keep

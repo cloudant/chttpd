@@ -134,7 +134,7 @@ handle_request(MochiReq) ->
             ?LOG_ERROR("attempted upload of invalid JSON ~s", [S]),
             send_error(HttpReq, {bad_request, "invalid UTF-8 JSON"});
         exit:{mochiweb_recv_error, E} ->
-            ?LOG_INFO(LogForClosedSocket ++ " - ~p", [E]),
+            twig:log(notice, LogForClosedSocket ++ " - ~p", [E]),
             exit(normal);
         throw:Error ->
             send_error(HttpReq, Error);
@@ -142,8 +142,8 @@ handle_request(MochiReq) ->
             send_error(HttpReq, database_does_not_exist);
         Tag:Error ->
             Stack = erlang:get_stacktrace(),
-            ?LOG_ERROR("Uncaught error in HTTP request: ~p",[{Tag, Error}]),
-            ?LOG_INFO("Stacktrace: ~p",[Stack]),
+            twig:log(error, "req_err ~p:~p ~p", [Tag, Error,
+                json_stack({Error, nil, Stack})]),
             send_error(HttpReq, {Error, nil, Stack})
     end,
 
@@ -155,7 +155,7 @@ handle_request(MochiReq) ->
         {aborted, Resp:get(code)}
     end,
     Host = MochiReq:get_header_value("Host"),
-    ?LOG_INFO("~s ~s ~s ~s ~B ~p ~B", [Peer, Host,
+    twig:log(info, "~s ~s ~s ~s ~B ~p ~B", [Peer, Host,
         atom_to_list(Method1), RawUri, Code, Status, round(RequestTime)]),
     couch_stats_collector:record({couchdb, request_time}, RequestTime),
     case Result of
@@ -450,10 +450,6 @@ send_chunk(Resp, Data) ->
 
 send_response(#httpd{mochi_req=MochiReq}=Req, Code, Headers, Body) ->
     couch_stats_collector:increment({httpd_status_codes, Code}),
-    if Code >= 400 ->
-        ?LOG_DEBUG("httpd ~p error response:~n ~s", [Code, Body]);
-    true -> ok
-    end,
     {ok, MochiReq:respond({Code, Headers ++ server_header() ++
         couch_httpd_auth:cookie_auth_header(Req, Headers), Body})}.
 
