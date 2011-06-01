@@ -182,9 +182,12 @@ create_db_req(#httpd{}=Req, DbName) ->
 
 delete_db_req(#httpd{}=Req, DbName) ->
     couch_httpd:verify_is_server_admin(Req),
-    case fabric:delete_db(DbName, []) of
+    W = couch_httpd:qs_value(Req, "w", couch_config:get("cluster", "w", "2")),
+    case fabric:delete_db(DbName, [{w, W}]) of
     ok ->
         send_json(Req, 200, {[{ok, true}]});
+    part_ok ->
+        send_json(Req, 202, {[{ok, true}]});
     Error ->
         throw(Error)
     end.
