@@ -168,8 +168,9 @@ create_db_req(#httpd{}=Req, DbName) ->
     N = couch_httpd:qs_value(Req, "n", couch_config:get("cluster", "n", "3")),
     Q = couch_httpd:qs_value(Req, "q", couch_config:get("cluster", "q", "8")),
     W = couch_httpd:qs_value(Req, "w", couch_config:get("cluster", "w", "2")),
+    Z = couch_httpd:qs_value(Req, "z", couch_config:get("cluster", "z", "3")),
     DocUrl = absolute_uri(Req, "/" ++ couch_util:url_encode(DbName)),
-    case fabric:create_db(DbName, [{n,N}, {q,Q}, {w, W}]) of
+    case fabric:create_db(DbName, [{n,N}, {q,Q}, {w, W}, {z,Z}]) of
     ok ->
         send_json(Req, 201, [{"Location", DocUrl}], {[{ok, true}]});
     part_ok ->
