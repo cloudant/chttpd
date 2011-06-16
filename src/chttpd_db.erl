@@ -786,7 +786,7 @@ couch_doc_open(Db, DocId, Rev, Options) ->
 
 % Attachment request handlers
 
-db_attachment_req(#httpd{method='GET'}=Req, Db, DocId, FileNameParts) ->
+db_attachment_req(#httpd{method='GET',mochi_req=MochiReq}=Req, Db, DocId, FileNameParts) ->
     FileName = list_to_binary(mochiweb_util:join(lists:map(fun binary_to_list/1,
         FileNameParts),"/")),
     #doc_query_args{
@@ -805,16 +805,6 @@ db_attachment_req(#httpd{method='GET'}=Req, Db, DocId, FileNameParts) ->
            atom_to_list(Enc),
            couch_httpd:accepted_encodings(Req)
         ),
-        Headers = [
-            {"ETag", Etag},
-            {"Cache-Control", "must-revalidate"},
-            {"Content-Type", binary_to_list(Type)}
-        ] ++ case ReqAcceptsAttEnc of
-        true ->
-            [{"Content-Encoding", atom_to_list(Enc)}];
-        _ ->
-            []
-        end,
         Len = case {Enc, ReqAcceptsAttEnc} of
         {identity, _} ->
             % stored and served in identity form
@@ -834,6 +824,23 @@ db_attachment_req(#httpd{method='GET'}=Req, Db, DocId, FileNameParts) ->
             % header we'll fall back to a chunked response.
             undefined
         end,
+        Headers = [
+            {"ETag", Etag},
+            {"Cache-Control", "must-revalidate"},
+            {"Content-Type", binary_to_list(Type)}
+        ] ++ case ReqAcceptsAttEnc of
+        true when Enc =/= identity ->
+            % RFC 2616 says that the 'identify' encoding should not be used in
+            % the Content-Encoding header
+            [{"Content-Encoding", atom_to_list(Enc)}];
+        _ ->
+            []
+        end ++ case Enc of
+            identity ->
+                [{"Accept-Ranges", "bytes"}];
+            _ ->
+                [{"Accept-Ranges", "none"}]
+        end,
         AttFun = case ReqAcceptsAttEnc of
         false ->
             fun couch_doc:att_foldl_decode/3;
@@ -847,11 +854,29 @@ db_attachment_req(#httpd{method='GET'}=Req, Db, DocId, FileNameParts) ->
                 case Len of
                 undefined ->
                     {ok, Resp} = start_chunked_response(Req, 200, Headers),
-                    AttFun(Att, fun(Seg, _) -> send_chunk(Resp, Seg) end, ok),
+                    AttFun(Att, fun(Seg, _) -> send_chunk(Resp, Seg) end, {ok, Resp}),
                     couch_httpd:last_chunk(Resp);
                 _ ->
-                    {ok, Resp} = start_response_length(Req, 200, Headers, Len),
-                    AttFun(Att, fun(Seg, _) -> send(Resp, Seg) end, ok)
+                    Ranges = parse_ranges(MochiReq:get(range), Len),
+                    case {Enc, Ranges} of
+                        {identity, [{From, To}]} ->
+                            Headers1 = [{<<"Content-Range">>, make_content_range(From, To, Len)}]
+                                ++ Headers,
+                            {ok, Resp} = start_response_length(Req, 206, Headers1, To - From + 1),
+                            couch_doc:range_att_foldl(Att, From, To + 1,
+                                fun(Seg, _) -> send(Resp, Seg) end, {ok, Resp});
+                        {identity, Ranges} when is_list(Ranges) ->
+                            send_ranges_multipart(Req, Type, Len, Att, Ranges);
+                        _ ->
+                            Headers1 = Headers ++
+                                if Enc =:= identity orelse ReqAcceptsAttEnc =:= true ->
+                                    [{"Content-MD5", base64:encode(Att#att.md5)}];
+                                true ->
+                                    []
+                            end,
+                            {ok, Resp} = start_response_length(Req, 200, Headers1, Len),
+                            AttFun(Att, fun(Seg, _) -> send(Resp, Seg) end, {ok, Resp})
+                    end
                 end
             end
         )
@@ -939,6 +964,51 @@ db_attachment_req(#httpd{method=Method, user_ctx=Ctx}=Req, Db, DocId, FileNamePa
 
 db_attachment_req(Req, _Db, _DocId, _FileNameParts) ->
     send_method_not_allowed(Req, "DELETE,GET,HEAD,PUT").
+
+send_ranges_multipart(Req, ContentType, Len, Att, Ranges) ->
+    Boundary = couch_uuids:random(),
+    CType = {"Content-Type",
+        "multipart/byteranges; boundary=\"" ++ ?b2l(Boundary) ++ "\""},
+    {ok, Resp} = start_chunked_response(Req, 206, [CType]),
+    couch_httpd:send_chunk(Resp, <<"--", Boundary/binary>>),
+    lists:foreach(fun({From, To}) ->
+        ContentRange = make_content_range(From, To, Len),
+        couch_httpd:send_chunk(Resp,
+            <<"\r\nContent-Type: ", ContentType/binary, "\r\n",
+            "Content-Range: ", ContentRange/binary, "\r\n",
+           "\r\n">>),
+        couch_doc:range_att_foldl(Att, From, To + 1,
+            fun(Seg, _) -> send_chunk(Resp, Seg) end, {ok, Resp}),
+        couch_httpd:send_chunk(Resp, <<"\r\n--", Boundary/binary>>)
+    end, Ranges),
+    couch_httpd:send_chunk(Resp, <<"--">>),
+    couch_httpd:last_chunk(Resp),
+    {ok, Resp}.
+
+parse_ranges(undefined, _Len) ->
+    undefined;
+parse_ranges(fail, _Len) ->
+    undefined;
+parse_ranges(Ranges, Len) ->
+    parse_ranges(Ranges, Len, []).
+
+parse_ranges([], _Len, Acc) ->
+    lists:reverse(Acc);
+parse_ranges([{From, To}|_], _Len, _Acc)
+  when is_integer(From) andalso is_integer(To) andalso To < From ->
+    throw(requested_range_not_satisfiable);
+parse_ranges([{From, To}|Rest], Len, Acc)
+  when is_integer(To) andalso To >= Len ->
+    parse_ranges([{From, Len-1}] ++ Rest, Len, Acc);
+parse_ranges([{none, To}|Rest], Len, Acc) ->
+    parse_ranges([{Len - To, Len - 1}] ++ Rest, Len, Acc);
+parse_ranges([{From, none}|Rest], Len, Acc) ->
+    parse_ranges([{From, Len - 1}] ++ Rest, Len, Acc);
+parse_ranges([{From,To}|Rest], Len, Acc) ->
+    parse_ranges(Rest, Len, [{From, To}] ++ Acc).
+
+make_content_range(From, To, Len) ->
+    ?l2b(io_lib:format("bytes ~B-~B/~B", [From, To, Len])).
 
 get_md5_header(Req) ->
     ContentMD5 = couch_httpd:header_value(Req, "Content-MD5"),
