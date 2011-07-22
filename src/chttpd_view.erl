@@ -33,10 +33,10 @@ multi_query_view(Req, Db, DDoc, ViewName, Queries) ->
         chttpd:qs(Req)),
     [couch_stats_collector:increment({httpd, view_reads}) || _I <- Queries],
     chttpd:etag_respond(Req, Etag, fun() ->
-        {ok, Resp} = chttpd:start_json_response(Req, 200, [{"Etag",Etag}]),
-        chttpd:send_chunk(Resp, "{\"results\":["),
+        FirstChunk = "{\"results\":[",
+        {ok, Resp} = start_view_response(Req, 200, [{"Etag",Etag}], FirstChunk),
         lists:foldl(fun({QueryProps}, Chunk) ->
-            if Chunk =/= nil -> chttpd:send_chunk(Resp, Chunk); true -> ok end,
+            if Chunk =/= nil -> send_view_chunk(Resp, Chunk); true -> ok end,
             ThisQuery = lists:flatmap(fun parse_json_view_param/1, QueryProps),
             FullParams = lists:ukeymerge(1, ThisQuery, DefaultParams),
             fabric:query_view(
@@ -49,8 +49,8 @@ multi_query_view(Req, Db, DDoc, ViewName, Queries) ->
             ),
             ",\n"
         end, nil, Queries),
-        chttpd:send_chunk(Resp, "]}"),
-        chttpd:end_json_response(Resp)
+        send_view_chunk(Resp, "]}"),
+        end_view_response(Resp)
     end).
 
 design_doc_view(Req, Db, DDoc, ViewName, Keys) ->
@@ -63,34 +63,32 @@ design_doc_view(Req, Db, DDoc, ViewName, Keys) ->
     Etag = couch_uuids:new(),
     couch_stats_collector:increment({httpd, view_reads}),
     chttpd:etag_respond(Req, Etag, fun() ->
-        {ok, Resp} = chttpd:start_json_response(Req, 200, [{"Etag",Etag}]),
+        {ok, Resp} = start_view_response(Req, 200, [{"Etag",Etag}]),
         CB = fun view_callback/2,
         fabric:query_view(Db, DDoc, ViewName, CB, {nil, Resp}, QueryArgs),
-        chttpd:end_json_response(Resp)
+        end_view_response(Resp)
     end).
 
 view_callback({total_and_offset, Total, Offset}, {nil, Resp}) ->
     Chunk = "{\"total_rows\":~p,\"offset\":~p,\"rows\":[\r\n",
-    send_chunk(Resp, io_lib:format(Chunk, [Total, Offset])),
+    send_view_chunk(Resp, io_lib:format(Chunk, [Total, Offset])),
     {ok, {"", Resp}};
 view_callback({total_and_offset, _, _}, Acc) ->
     % a sorted=false view where the message came in late.  Ignore.
     {ok, Acc};
 view_callback({row, Row}, {nil, Resp}) ->
     % first row of a reduce view, or a sorted=false view
-    send_chunk(Resp, ["{\"rows\":[\r\n", ?JSON_ENCODE(Row)]),
+    send_view_chunk(Resp, ["{\"rows\":[\r\n", ?JSON_ENCODE(Row)]),
     {ok, {",\r\n", Resp}};
 view_callback({row, Row}, {Prepend, Resp}) ->
-    send_chunk(Resp, [Prepend, ?JSON_ENCODE(Row)]),
+    send_view_chunk(Resp, [Prepend, ?JSON_ENCODE(Row)]),
     {ok, {",\r\n", Resp}};
 view_callback(complete, {nil, Resp}) ->
-    send_chunk(Resp, "{\"rows\":[]}");
+    send_view_chunk(Resp, "{\"rows\":[]}");
 view_callback(complete, {_, Resp}) ->
-    send_chunk(Resp, "\r\n]}");
+    send_view_chunk(Resp, "\r\n]}");
 view_callback({error, Reason}, {_, Resp}) ->
-    {Code, ErrorStr, ReasonStr} = chttpd:error_info(Reason),
-    Json = {[{code,Code}, {error,ErrorStr}, {reason,ReasonStr}]},
-    send_chunk(Resp, [$\n, ?JSON_ENCODE(Json), $\n]).
+    send_view_error(Resp, Reason).
 
 extract_view_type(_ViewName, [], _IsReduce) ->
     throw({not_found, missing_named_view});
@@ -382,3 +380,36 @@ parse_positive_int_param(Val) ->
         Msg = io_lib:format(Fmt, [Val]),
         throw({query_parse_error, ?l2b(Msg)})
     end.
+
+start_view_response(Req, Code, Headers) ->
+    start_view_response(Req, Code, Headers, "").
+
+start_view_response(Req, Code, Headers, FirstChunk) ->
+    {ok, {view_resp, Req, Code, Headers, FirstChunk}}.
+
+end_view_response({view_resp, Req, Code, Headers, FirstChunk}) ->
+    {ok, Resp1} = chttpd:start_json_response(Req, Code, Headers),
+    {ok, Resp2} = case FirstChunk of
+        "" -> {ok, Resp1};
+        _ -> send_view_chunk(Resp1, FirstChunk)
+    end,
+    end_view_response(Resp2);
+end_view_response(Resp) ->
+    chttpd:end_json_response(Resp).
+
+send_view_chunk({view_resp, Req, Code, Headers, FirstChunk}, Chunk) ->
+    {ok, Resp1} = chttpd:start_json_response(Req, Code, Headers),
+    {ok, Resp2} = case FirstChunk of
+        "" -> {ok, Resp1};
+        _ -> send_view_chunk(Resp1, FirstChunk)
+    end,
+    send_view_chunk(Resp2, Chunk);
+send_view_chunk(Resp, Chunk) ->
+    chttpd:send_json(Resp, Chunk).
+
+send_view_error({view_resp, Req, _, _, _}, Reason) ->
+    {Code, ErrorStr, ReasonStr} = chttpd:error_info(Reason),
+    chttpd:send_error(Req, Code, ErrorStr, ReasonStr);
+send_view_error(Resp, _Reason) ->
+    {ok, Resp}.
+
