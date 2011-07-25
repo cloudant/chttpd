@@ -31,22 +31,22 @@ multi_query_view(Req, Db, DDoc, ViewName, Queries) ->
     chttpd:etag_respond(Req, Etag, fun() ->
         FirstChunk = "{\"results\":[",
         {ok, Resp} = start_view_response(Req, 200, [{"Etag",Etag}], FirstChunk),
-        lists:foldl(fun({QueryProps}, Chunk) ->
+        {_, Resp1} = lists:foldl(fun({QueryProps}, {Chunk, RespAcc}) ->
             if Chunk =/= nil -> send_view_chunk(Resp, Chunk); true -> ok end,
             ThisQuery = lists:flatmap(fun parse_json_view_param/1, QueryProps),
             FullParams = lists:ukeymerge(1, ThisQuery, DefaultParams),
-            fabric:query_view(
+            {ok, RespAcc1} = fabric:query_view(
                 Db,
                 DDoc,
                 ViewName,
                 fun view_callback/2,
-                {nil, Resp},
+                {nil, RespAcc},
                 parse_view_params(FullParams, nil, ViewType)
             ),
-            ",\n"
-        end, nil, Queries),
-        send_view_chunk(Resp, "]}"),
-        end_view_response(Resp)
+            {",\n", RespAcc1}
+        end, {nil,Resp}, Queries),
+        send_view_chunk(Resp1, "]}"),
+        end_view_response(Resp1)
     end).
 
 design_doc_view(Req, Db, DDoc, ViewName, Keys) ->
@@ -61,24 +61,24 @@ design_doc_view(Req, Db, DDoc, ViewName, Keys) ->
     chttpd:etag_respond(Req, Etag, fun() ->
         {ok, Resp} = start_view_response(Req, 200, [{"Etag",Etag}]),
         CB = fun view_callback/2,
-        fabric:query_view(Db, DDoc, ViewName, CB, {nil, Resp}, QueryArgs),
-        end_view_response(Resp)
+        {ok, Resp1} = fabric:query_view(Db, DDoc, ViewName, CB, {nil, Resp}, QueryArgs),
+        end_view_response(Resp1)
     end).
 
 view_callback({total_and_offset, Total, Offset}, {nil, Resp}) ->
     Chunk = "{\"total_rows\":~p,\"offset\":~p,\"rows\":[\r\n",
-    send_view_chunk(Resp, io_lib:format(Chunk, [Total, Offset])),
-    {ok, {"", Resp}};
+    {ok, Resp1} = send_view_chunk(Resp, io_lib:format(Chunk, [Total, Offset])),
+    {ok, {"", Resp1}};
 view_callback({total_and_offset, _, _}, Acc) ->
     % a sorted=false view where the message came in late.  Ignore.
     {ok, Acc};
 view_callback({row, Row}, {nil, Resp}) ->
     % first row of a reduce view, or a sorted=false view
-    send_view_chunk(Resp, ["{\"rows\":[\r\n", ?JSON_ENCODE(Row)]),
-    {ok, {",\r\n", Resp}};
+    {ok, Resp1} = send_view_chunk(Resp, ["{\"rows\":[\r\n", ?JSON_ENCODE(Row)]),
+    {ok, {",\r\n", Resp1}};
 view_callback({row, Row}, {Prepend, Resp}) ->
-    send_view_chunk(Resp, [Prepend, ?JSON_ENCODE(Row)]),
-    {ok, {",\r\n", Resp}};
+    {ok, Resp1} = send_view_chunk(Resp, [Prepend, ?JSON_ENCODE(Row)]),
+    {ok, {",\r\n", Resp1}};
 view_callback(complete, {nil, Resp}) ->
     send_view_chunk(Resp, "{\"rows\":[]}");
 view_callback(complete, {_, Resp}) ->
