@@ -150,7 +150,17 @@ possibly_hack(#httpd{path_parts=[<<"_replicate">>]}=Req) ->
     Props2 = fix_uri(Req, Props1, <<"target">>),
     put(post_body, {Props2}),
     Req;
+possibly_hack(#httpd{method='POST',path_parts=[<<"_replicator">>]}=Req) ->
+    validate_replication_req(Req);
+possibly_hack(#httpd{method='PUT',path_parts=[<<"_replicator">>, _]}=Req) ->
+    validate_replication_req(Req);
 possibly_hack(Req) ->
+    Req.
+
+validate_replication_req(Req) ->
+    {Props} = couch_httpd:json_body_obj(Req),
+    is_http(<<"source">>, Props),
+    is_http(<<"target">>, Props),
     Req.
 
 fix_uri(Req, Props, Type) ->
@@ -168,6 +178,14 @@ replication_uri(Type, PostProps) ->
         couch_util:get_value(<<"url">>, Props);
     Else ->
         Else
+    end.
+
+is_http(Type, Props) ->
+    case is_http(couch_util:get_value(Type, Props)) of
+        true ->
+            ok;
+        false ->
+            throw({bad_request, <<"'", Type/binary, "' must be a full url.">>})
     end.
 
 is_http(<<"http://", _/binary>>) ->
