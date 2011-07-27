@@ -106,7 +106,7 @@ handle_request(MochiReq) ->
         case authenticate_request(HttpReq, AuthenticationFuns) of
         #httpd{} = Req ->
             HandlerFun = url_handler(HandlerKey),
-            HandlerFun(validate_req(Req));
+            HandlerFun(possibly_hack(Req));
         Response ->
             Response
         end
@@ -139,29 +139,54 @@ handle_request(MochiReq) ->
     couch_stats_collector:increment({httpd, requests}),
     {ok, Resp}.
 
-validate_req(#httpd{path_parts=[<<"_replicate">>]}=Req) ->
-    validate_replication_req(Req);
-validate_req(#httpd{method='POST',path_parts=[<<"_replicator">>]}=Req) ->
-    validate_replication_req(Req);
-validate_req(#httpd{method='PUT',path_parts=[<<"_replicator">>, _]}=Req) ->
-    validate_replication_req(Req);
-validate_req(Req) ->
+%% HACK: replication currently handles two forms of input, #db{} style
+%% and #http_db style. We need a third that makes use of fabric. #db{}
+%% works fine for replicating the dbs and nodes database because they
+%% aren't sharded. So for now when a local db is specified as the source or
+%% the target, it's hacked to make it a full url and treated as a remote.
+possibly_hack(#httpd{path_parts=[<<"_replicate">>]}=Req) ->
+    {Props0} = couch_httpd:json_body_obj(Req),
+    Props1 = fix_uri(Req, Props0, <<"source">>),
+    Props2 = fix_uri(Req, Props1, <<"target">>),
+    put(post_body, {Props2}),
+    Req;
+possibly_hack(Req) ->
     Req.
 
-validate_replication_req(Req) ->
-    {Props} = couch_httpd:json_body_obj(Req),
-    is_http(<<"source">>, Props),
-    is_http(<<"target">>, Props),
-    Req.
+fix_uri(Req, Props, Type) ->
+    case is_http(replication_uri(Type, Props)) of
+    true ->
+        Props;
+    false ->
+        Uri = make_uri(Req,replication_uri(Type, Props)),
+        [{Type,Uri}|proplists:delete(Type,Props)]
+    end.
 
-is_http(Type, Props) when is_list(Props) ->
-    is_http(Type, couch_util:get_value(Type, Props));
-is_http(_Type, <<"http://", _/binary>>) ->
-    ok;
-is_http(_Type, <<"https://", _/binary>>) ->
-    ok;
-is_http(Type, _) ->
-    throw({bad_request, <<"'", Type/binary, "' must be a full url.">>}).
+replication_uri(Type, PostProps) ->
+    case couch_util:get_value(Type, PostProps) of
+    {Props} ->
+        couch_util:get_value(<<"url">>, Props);
+    Else ->
+        Else
+    end.
+
+is_http(<<"http://", _/binary>>) ->
+    true;
+is_http(<<"https://", _/binary>>) ->
+    true;
+is_http(_) ->
+    false.
+
+make_uri(Req, Raw) ->
+    Url = list_to_binary(["http://", couch_config:get("httpd", "bind_address"),
+                         ":", couch_config:get("chttpd", "port"), "/", Raw]),
+    Headers = [
+        {<<"authorization">>, ?l2b(header_value(Req,"authorization",""))},
+        {<<"cookie">>, ?l2b(header_value(Req,"cookie",""))}
+    ],
+    {[{<<"url">>,Url}, {<<"headers">>,{Headers}}]}.
+%%% end hack
+
 
 % Try authentication handlers in order until one returns a result
 authenticate_request(#httpd{user_ctx=#user_ctx{}} = Req, _AuthFuns) ->
