@@ -474,29 +474,26 @@ db_doc_req(#httpd{method='DELETE'}=Req, Db, DocId) ->
     end,
     update_doc(Req, Db, DocId, couch_doc_from_req(Req, DocId, Body));
 
-db_doc_req(#httpd{method='GET'}=Req, Db, DocId) ->
+db_doc_req(#httpd{method='GET',mochi_req=MochiReq}=Req, Db, DocId) ->
     #doc_query_args{
         rev = Rev,
         open_revs = Revs,
-        options = Options,
+        options = Options1,
         atts_since = AttsSince
     } = parse_doc_query(Req),
+    Options = case AttsSince of
+    nil ->
+        Options1;
+    RevList when is_list(RevList) ->
+        [{atts_since, RevList}, attachments | Options1]
+    end,
     case Revs of
     [] ->
-        Options2 =
-        if AttsSince /= nil ->
-            [{atts_since, AttsSince}, attachments | Options];
-        true -> Options
-        end,
-        Doc = couch_doc_open(Db, DocId, Rev, Options2),
-        send_doc(Req, Doc, Options2);
+        Doc = couch_doc_open(Db, DocId, Rev, Options),
+        send_doc(Req, Doc, Options);
     _ ->
         {ok, Results} = fabric:open_revs(Db, DocId, Revs, Options),
-        AcceptedTypes = case couch_httpd:header_value(Req, "Accept") of
-            undefined       -> [];
-            AcceptHeader    -> string:tokens(AcceptHeader, ", ")
-        end,
-        case lists:member("multipart/mixed", AcceptedTypes) of
+        case MochiReq:accepts_content_type("multipart/mixed") of
         false ->
             {ok, Resp} = start_json_response(Req, 200),
             send_chunk(Resp, "["),
@@ -642,14 +639,10 @@ send_doc(Req, Doc, Options) ->
 
 send_doc_efficiently(Req, #doc{atts=[]}=Doc, Headers, Options) ->
         send_json(Req, 200, Headers, couch_doc:to_json_obj(Doc, Options));
-send_doc_efficiently(Req, #doc{atts=Atts}=Doc, Headers, Options) ->
+send_doc_efficiently(#httpd{mochi_req=MochiReq}=Req, #doc{atts=Atts}=Doc, Headers, Options) ->
     case lists:member(attachments, Options) of
     true ->
-        AcceptedTypes = case couch_httpd:header_value(Req, "Accept") of
-            undefined       -> [];
-            AcceptHeader    -> string:tokens(AcceptHeader, ", ")
-        end,
-        case lists:member("multipart/related", AcceptedTypes) of
+        case MochiReq:accepts_content_type("multipart/related") of
         false ->
             send_json(Req, 200, Headers, couch_doc:to_json_obj(Doc, Options));
         true ->
