@@ -143,31 +143,29 @@ handle_request(MochiReq) ->
 %% and #http_db style. We need a third that makes use of fabric. #db{}
 %% works fine for replicating the dbs and nodes database because they
 %% aren't sharded. So for now when a local db is specified as the source or
-%% the target, it's hacked to make it a full url and treated as a remote.
+%% the target, it's rejected.
 possibly_hack(#httpd{path_parts=[<<"_replicate">>]}=Req) ->
-    {Props0} = couch_httpd:json_body_obj(Req),
-    Props1 = fix_uri(Req, Props0, <<"source">>),
-    Props2 = fix_uri(Req, Props1, <<"target">>),
-    put(post_body, {Props2}),
-    Req;
+    validate_replication_req(Req);
+possibly_hack(#httpd{method='POST',path_parts=[<<"_replicator">>]}=Req) ->
+    validate_replication_req(Req);
+possibly_hack(#httpd{method='PUT',path_parts=[<<"_replicator">>, _]}=Req) ->
+    validate_replication_req(Req);
 possibly_hack(Req) ->
     Req.
 
-fix_uri(Req, Props, Type) ->
-    case is_http(replication_uri(Type, Props)) of
-    true ->
-        Props;
-    false ->
-        Uri = make_uri(Req,replication_uri(Type, Props)),
-        [{Type,Uri}|proplists:delete(Type,Props)]
-    end.
+validate_replication_req(Req) ->
+    {Props} = couch_httpd:json_body_obj(Req),
+    is_http(<<"source">>, Props),
+    is_http(<<"target">>, Props),
+    put(post_body, {Props}),
+    Req.
 
-replication_uri(Type, PostProps) ->
-    case couch_util:get_value(Type, PostProps) of
-    {Props} ->
-        couch_util:get_value(<<"url">>, Props);
-    Else ->
-        Else
+is_http(Type, Props) ->
+    case is_http(couch_util:get_value(Type, Props)) of
+        true ->
+            ok;
+        false ->
+            throw({bad_request, <<"'", Type/binary, "' must be a full url.">>})
     end.
 
 is_http(<<"http://", _/binary>>) ->
@@ -176,17 +174,7 @@ is_http(<<"https://", _/binary>>) ->
     true;
 is_http(_) ->
     false.
-
-make_uri(Req, Raw) ->
-    Url = list_to_binary(["http://", couch_config:get("httpd", "bind_address"),
-                         ":", couch_config:get("chttpd", "port"), "/", Raw]),
-    Headers = [
-        {<<"authorization">>, ?l2b(header_value(Req,"authorization",""))},
-        {<<"cookie">>, ?l2b(header_value(Req,"cookie",""))}
-    ],
-    {[{<<"url">>,Url}, {<<"headers">>,{Headers}}]}.
-%%% end hack
-
+% end hack
 
 % Try authentication handlers in order until one returns a result
 authenticate_request(#httpd{user_ctx=#user_ctx{}} = Req, _AuthFuns) ->
