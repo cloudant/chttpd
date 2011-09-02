@@ -112,7 +112,12 @@ handle_request(MochiReq) ->
         case authenticate_request(HttpReq, AuthenticationFuns) of
         #httpd{} = Req ->
             HandlerFun = url_handler(HandlerKey),
-            HandlerFun(possibly_hack(Req));
+            case possibly_proxy(Req) of
+                #httpd{} = Req ->
+                    HandlerFun(possibly_hack(Req));
+                Response ->
+                    Response
+            end;
         Response ->
             Response
         end
@@ -172,6 +177,49 @@ possibly_hack(#httpd{path_parts=[<<"_replicate">>]}=Req) ->
     Req;
 possibly_hack(Req) ->
     Req.
+
+possibly_proxy(#httpd{path_parts=[<<"_replicate">>]}=Req) ->
+    {Props} = couch_httpd:json_body_obj(Req),
+    Node = choose_node([
+        couch_util:get_value(<<"source">>, Props),
+        couch_util:get_value(<<"target">>, Props)
+    ]),
+    case node() of
+        Node -> Req;
+        _ -> proxy(Req, Node)
+    end;
+possibly_proxy(Req) ->
+    Req.
+
+choose_node(Key) when is_binary(Key) ->
+    Checksum = erlang:crc32(Key),
+    Nodes = lists:sort([node()|erlang:nodes()]),
+    lists:nth(1 + Checksum rem length(Nodes), Nodes);
+choose_node(Key) ->
+    choose_node(term_to_binary(Key)).
+
+proxy(#httpd{mochi_req=MochiReq}=Req, ProxyNode) ->
+    ProxyAddress = rpc:call(ProxyNode, couch_config, get,
+        ["httpd", "bind_address"]),
+    ProxyPort = rpc:call(ProxyNode, couch_config, get,
+        ["chttpd", "port"]),
+    Url = "http://" ++ ProxyAddress ++ ":" ++ ProxyPort ++
+        MochiReq:get(raw_path),
+    Headers = mochiweb_headers:to_list(MochiReq:get(headers)),
+    Method = list_to_atom(string:to_lower(atom_to_list(MochiReq:get(method)))),
+    Body = MochiReq:recv_body(),
+    Options = [
+        {http_vsn, MochiReq:get(version)},
+        {headers_as_is, true},
+        {response_format, binary}
+    ],
+    case ibrowse:send_req(Url, Headers, Method, Body, Options, infinity) of
+        {ok, Status, ResponseHeaders, ResponseBody} ->
+            send_response(Req, list_to_integer(Status),
+                ResponseHeaders, ResponseBody);
+        {error, Reason} ->
+            throw({error, Reason})
+    end.
 
 fix_uri(Req, Props, Type) ->
     case is_http(replication_uri(Type, Props)) of
