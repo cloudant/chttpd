@@ -633,7 +633,7 @@ error_headers(#httpd{mochi_req=MochiReq}=Req, 401=Code, ErrorStr, ReasonStr) ->
                             end,
                             UrlReturn = ?l2b(couch_util:url_encode(UrlReturnRaw)),
                             UrlReason = ?l2b(couch_util:url_encode(ReasonStr)),
-                            {302, [{"Location", couch_httpd:absolute_uri(Req, <<AuthRedirectBin/binary,"?return=",UrlReturn/binary,"&reason=",UrlReason/binary>>)}]}
+                            {302, [{"Location", absolute_uri(Req, <<AuthRedirectBin/binary,"?return=",UrlReturn/binary,"&reason=",UrlReason/binary>>)}]}
                         end
                     end
                 end;
@@ -686,7 +686,7 @@ send_chunked_error(Resp, Error) ->
     send_chunk(Resp, []).
 
 send_redirect(Req, Path) ->
-     Headers = [{"Location", chttpd:absolute_uri(Req, Path)}],
+     Headers = [{"Location", absolute_uri(Req, Path)}],
      send_response(Req, 301, Headers, <<>>).
 
 server_header() ->
