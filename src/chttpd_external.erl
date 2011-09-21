@@ -61,7 +61,6 @@ process_external_req(HttpReq, Db, Name) ->
 json_req_obj(Req, Db) -> json_req_obj(Req, Db, null).
 json_req_obj(#httpd{mochi_req=Req,
                method=Method,
-               path_parts=Path,
                req_body=ReqBody
             }, Db, DocId) ->
     Body = case ReqBody of
@@ -78,8 +77,9 @@ json_req_obj(#httpd{mochi_req=Req,
     Hlist = mochiweb_headers:to_list(Headers),
     {ok, Info} = fabric:get_db_info(Db),
 
+    Path = Req:path(),
     % add headers...
-    {[{<<"info">>, {Info}},
+    {[{<<"info">>, {Req:db_info(Info)}},
         {<<"uuid">>, couch_uuids:new()},
         {<<"id">>, DocId},
         {<<"method">>, Method},
@@ -90,7 +90,7 @@ json_req_obj(#httpd{mochi_req=Req,
         {<<"peer">>, ?l2b(Req:get(peer))},
         {<<"form">>, to_json_terms(ParsedForm)},
         {<<"cookie">>, to_json_terms(Req:parse_cookie())},
-        {<<"userCtx">>, couch_util:json_user_ctx(Db)}]}.
+        {<<"userCtx">>, couch_util:json_user_ctx(Db#db{name=hd(Path)})}]}.
 
 to_json_terms(Data) ->
     to_json_terms(Data, []).
@@ -111,6 +111,8 @@ json_query_keys([{<<"endkey">>, Value} | Rest], Acc) ->
     json_query_keys(Rest, [{<<"endkey">>, ?JSON_DECODE(Value)}|Acc]);
 json_query_keys([{<<"key">>, Value} | Rest], Acc) ->
     json_query_keys(Rest, [{<<"key">>, ?JSON_DECODE(Value)}|Acc]);
+json_query_keys([{<<"descending">>, Value} | Rest], Acc) ->
+    json_query_keys(Rest, [{<<"descending">>, ?JSON_DECODE(Value)}|Acc]);
 json_query_keys([Term | Rest], Acc) ->
     json_query_keys(Rest, [Term|Acc]).
 

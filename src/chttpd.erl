@@ -13,7 +13,7 @@
 -module(chttpd).
 -include_lib("couch/include/couch_db.hrl").
 
--export([start_link/0, stop/0, handle_request/1, config_change/2,
+-export([start_link/0, stop/0, do_request/1, handle_request/4, config_change/2,
     primary_header_value/2, header_value/2, header_value/3, qs_value/2,
     qs_value/3, qs/1, path/1, absolute_uri/2, body_length/1,
     verify_is_server_admin/1, unquote/1, quote/1, recv/2, recv_chunked/4,
@@ -22,8 +22,9 @@
     server_header/0, start_chunked_response/3,send_chunk/2,
     start_response_length/4, send/2, start_json_response/2,
     start_json_response/3, end_json_response/1, send_response/4,
-    send_method_not_allowed/2, send_error/2, send_error/4, send_redirect/2,
-    send_chunked_error/2, send_json/2,send_json/3,send_json/4]).
+    send_method_not_allowed/2, send_error/2, send_error/4, send_error/5,
+    send_redirect/2, send_chunked_error/2,
+    send_json/2, send_json/3, send_json/4]).
 
 -export([start_delayed_json_response/2, start_delayed_json_response/3,
     start_delayed_json_response/4,
@@ -31,6 +32,10 @@
     send_delayed_chunk/2, send_delayed_last_chunk/1,
     send_delayed_error/2, end_delayed_json_response/1,
     get_delayed_req/1]).
+
+-export([dispatch_request/2, log_request/7, admin_roles/0,
+    db_info/2, get_path/1, make_uri/2, build_uri/4, default_headers/1,
+    url_handler/1, db_url_handlers/0, design_url_handlers/0]).
 
 -record(delayed_resp, {
     start_fun,
@@ -42,7 +47,7 @@
 
 start_link() ->
     Options = [
-        {loop, fun ?MODULE:handle_request/1},
+        {loop, make_loop_fun()},
         {name, ?MODULE},
         {ip, couch_config:get("chttpd", "bind_address", any)},
         {port, couch_config:get("chttpd", "port", "5984")},
@@ -67,10 +72,8 @@ config_change("chttpd", "backlog") ->
 stop() ->
     mochiweb_http:stop(?MODULE).
 
-handle_request(MochiReq) ->
-    Begin = now(),
-
-    AuthenticationFuns = [
+do_request(MochiReq) ->
+    AuthFuns = [
         fun couch_httpd_auth:cookie_authentication_handler/1,
         fun couch_httpd_auth:default_authentication_handler/1
     ],
@@ -79,8 +82,12 @@ handle_request(MochiReq) ->
     % removed, but URL quoting left intact
     RawUri = MochiReq:get(raw_path),
     {"/" ++ Path, _, _} = mochiweb_util:urlsplit_path(RawUri),
-    {HandlerKey, _, _} = mochiweb_util:partition(Path, "/"),
+    handle_request(?MODULE, MochiReq, AuthFuns, Path).
 
+handle_request(Module, MochiReq, AuthFuns, Path) ->
+    Begin = now(),
+
+    RawUri = MochiReq:get(raw_path),
     Peer = MochiReq:get(peer),
     LogForClosedSocket = io_lib:format("mochiweb_recv_error for ~s - ~p ~s", [
         Peer,
@@ -104,24 +111,25 @@ handle_request(MochiReq) ->
         Other -> Other
     end,
 
-    HttpReq = #httpd{
+    BaseReq = #httpd{
         mochi_req = MochiReq,
         method = Method,
         path_parts = [list_to_binary(chttpd:unquote(Part))
                 || Part <- string:tokens(Path, "/")],
-        db_url_handlers = db_url_handlers(),
-        design_url_handlers = design_url_handlers()
+        db_url_handlers = Module:db_url_handlers(),
+        design_url_handlers = Module:design_url_handlers()
     },
+    ChttpdReq = chttpd_req:new(Module, BaseReq, MochiReq),
+    HttpReq = BaseReq#httpd{mochi_req=ChttpdReq},
 
     % put small token on heap to keep requests synced to backend calls
     erlang:put(nonce, couch_util:to_hex(crypto:rand_bytes(4))),
 
     Result =
     try
-        case authenticate_request(HttpReq, AuthenticationFuns) of
+        case authenticate_request(Module, HttpReq, AuthFuns) of
         #httpd{} = Req ->
-            HandlerFun = url_handler(HandlerKey),
-            HandlerFun(possibly_hack(Req));
+            Module:dispatch_request(possibly_hack(Module, Req), Path);
         Response ->
             Response
         end
@@ -134,7 +142,7 @@ handle_request(MochiReq) ->
             ?LOG_ERROR("attempted upload of invalid JSON ~s", [S]),
             send_error(HttpReq, {bad_request, "invalid UTF-8 JSON"});
         exit:{mochiweb_recv_error, E} ->
-            ?LOG_INFO(LogForClosedSocket ++ " - ~p", [E]),
+            twig:log(notice, LogForClosedSocket ++ " - ~p", [E]),
             exit(normal);
         throw:Error ->
             send_error(HttpReq, Error);
@@ -142,8 +150,8 @@ handle_request(MochiReq) ->
             send_error(HttpReq, database_does_not_exist);
         Tag:Error ->
             Stack = erlang:get_stacktrace(),
-            ?LOG_ERROR("Uncaught error in HTTP request: ~p",[{Tag, Error}]),
-            ?LOG_INFO("Stacktrace: ~p",[Stack]),
+            twig:log(error, "req_err ~p:~p ~p", [Tag, Error,
+                json_stack({Error, nil, Stack})]),
             send_error(HttpReq, {Error, nil, Stack})
     end,
 
@@ -155,8 +163,10 @@ handle_request(MochiReq) ->
         {aborted, Resp:get(code)}
     end,
     Host = MochiReq:get_header_value("Host"),
-    ?LOG_INFO("~s ~s ~s ~s ~B ~p ~B", [Peer, Host,
-        atom_to_list(Method1), RawUri, Code, Status, round(RequestTime)]),
+    Module:log_request(
+        Peer, Host, atom_to_list(Method1), RawUri,
+        Code, Status, round(RequestTime)
+    ),
     couch_stats_collector:record({couchdb, request_time}, RequestTime),
     case Result of
     {ok, _} ->
@@ -173,21 +183,21 @@ handle_request(MochiReq) ->
 %% works fine for replicating the dbs and nodes database because they
 %% aren't sharded. So for now when a local db is specified as the source or
 %% the target, it's hacked to make it a full url and treated as a remote.
-possibly_hack(#httpd{path_parts=[<<"_replicate">>]}=Req) ->
+possibly_hack(Module, #httpd{path_parts=[<<"_replicate">>]}=Req) ->
     {Props0} = couch_httpd:json_body_obj(Req),
-    Props1 = fix_uri(Req, Props0, <<"source">>),
-    Props2 = fix_uri(Req, Props1, <<"target">>),
+    Props1 = fix_uri(Module, Req, Props0, <<"source">>),
+    Props2 = fix_uri(Module, Req, Props1, <<"target">>),
     put(post_body, {Props2}),
     Req;
-possibly_hack(Req) ->
+possibly_hack(_Module, Req) ->
     Req.
 
-fix_uri(Req, Props, Type) ->
+fix_uri(Module, Req, Props, Type) ->
     case is_http(replication_uri(Type, Props)) of
     true ->
         Props;
     false ->
-        Uri = make_uri(Req,replication_uri(Type, Props)),
+        Uri = Module:make_uri(Req,replication_uri(Type, Props)),
         [{Type,Uri}|proplists:delete(Type,Props)]
     end.
 
@@ -205,80 +215,42 @@ is_http(<<"https://", _/binary>>) ->
     true;
 is_http(_) ->
     false.
-
-make_uri(Req, Raw) ->
-    Url = list_to_binary(["http://", couch_config:get("httpd", "bind_address"),
-                         ":", couch_config:get("chttpd", "port"), "/", Raw]),
-    Headers = [
-        {<<"authorization">>, ?l2b(header_value(Req,"authorization",""))},
-        {<<"cookie">>, ?l2b(header_value(Req,"cookie",""))}
-    ],
-    {[{<<"url">>,Url}, {<<"headers">>,{Headers}}]}.
 %%% end hack
 
 
 % Try authentication handlers in order until one returns a result
-authenticate_request(#httpd{user_ctx=#user_ctx{}} = Req, _AuthFuns) ->
+authenticate_request(_Module, #httpd{user_ctx=#user_ctx{}} = Req, _AuthFuns) ->
     Req;
-authenticate_request(#httpd{} = Req, [AuthFun|Rest]) ->
-    authenticate_request(AuthFun(Req), Rest);
-authenticate_request(#httpd{} = Req, []) ->
+authenticate_request(Module, #httpd{} = Req, [AuthFun|Rest]) ->
+    authenticate_request(Module, AuthFun(Req), Rest);
+authenticate_request(Module, #httpd{} = Req, []) ->
     case couch_config:get("chttpd", "require_valid_user", "false") of
     "true" ->
         throw({unauthorized, <<"Authentication required.">>});
     "false" ->
         case couch_config:get("admins") of
         [] ->
-            Ctx = #user_ctx{roles=[<<"_reader">>, <<"_writer">>, <<"_admin">>]},
+            Ctx = #user_ctx{roles=Module:admin_roles()},
             Req#httpd{user_ctx = Ctx};
         _ ->
             Req#httpd{user_ctx=#user_ctx{}}
         end
     end;
-authenticate_request(Response, _AuthFuns) ->
+authenticate_request(_Module, Response, _AuthFuns) ->
     Response.
 
 increment_method_stats(Method) ->
     couch_stats_collector:increment({httpd_request_methods, Method}).
 
-url_handler("") ->              fun chttpd_misc:handle_welcome_req/1;
-url_handler("favicon.ico") ->   fun chttpd_misc:handle_favicon_req/1;
-url_handler("_utils") ->        fun chttpd_misc:handle_utils_dir_req/1;
-url_handler("_all_dbs") ->      fun chttpd_misc:handle_all_dbs_req/1;
-url_handler("_active_tasks") -> fun chttpd_misc:handle_task_status_req/1;
-url_handler("_config") ->       fun chttpd_misc:handle_config_req/1;
-url_handler("_replicate") ->    fun chttpd_misc:handle_replicate_req/1;
-url_handler("_uuids") ->        fun chttpd_misc:handle_uuids_req/1;
-url_handler("_log") ->          fun chttpd_misc:handle_log_req/1;
-url_handler("_sleep") ->        fun chttpd_misc:handle_sleep_req/1;
-url_handler("_session") ->      fun couch_httpd_auth:handle_session_req/1;
-url_handler("_oauth") ->        fun couch_httpd_oauth:handle_oauth_req/1;
-%% showroom_http module missing in bigcouch
-url_handler("_restart") ->      fun showroom_http:handle_restart_req/1;
-url_handler("_membership") ->   fun mem3_httpd:handle_membership_req/1;
-url_handler(_) ->               fun chttpd_db:handle_request/1.
-
-db_url_handlers() ->
-    [
-        {<<"_view_cleanup">>,   fun chttpd_db:handle_view_cleanup_req/2},
-        {<<"_compact">>,        fun chttpd_db:handle_compact_req/2},
-        {<<"_design">>,         fun chttpd_db:handle_design_req/2},
-        {<<"_temp_view">>,      fun chttpd_view:handle_temp_view_req/2},
-        {<<"_changes">>,        fun chttpd_db:handle_changes_req/2},
-        {<<"_search">>,         fun chttpd_external:handle_search_req/2}
-    ].
-
-design_url_handlers() ->
-    [
-        {<<"_view">>,           fun chttpd_view:handle_view_req/3},
-        {<<"_show">>,           fun chttpd_show:handle_doc_show_req/3},
-        {<<"_list">>,           fun chttpd_show:handle_view_list_req/3},
-        {<<"_update">>,         fun chttpd_show:handle_doc_update_req/3},
-        {<<"_info">>,           fun chttpd_db:handle_design_info_req/3},
-        {<<"_rewrite">>,        fun chttpd_rewrite:handle_rewrite_req/3}
-    ].
-
 % Utilities
+
+make_loop_fun() ->
+    DefLoopFunName = "{chttpd, do_request}",
+    LoopFunName = couch_config:get("chttpd", "loop_fun", DefLoopFunName),
+    case (catch couch_util:parse_term(LoopFunName)) of
+        {ok, {Mod, Fun}} -> fun(Req) -> Mod:Fun(Req) end;
+        _ -> throw({error, invalid_loop_fun})
+    end.
 
 partition(Path) ->
     mochiweb_util:partition(Path, "/").
@@ -295,9 +267,8 @@ header_value(#httpd{mochi_req=MochiReq}, Key, Default) ->
 primary_header_value(#httpd{mochi_req=MochiReq}, Key) ->
     MochiReq:get_primary_header_value(Key).
 
-serve_file(#httpd{mochi_req=MochiReq}=Req, RelativePath, DocumentRoot) ->
-    {ok, MochiReq:serve_file(RelativePath, DocumentRoot,
-        server_header() ++ couch_httpd_auth:cookie_auth_header(Req, []))}.
+serve_file(#httpd{mochi_req=MochiReq}, RelativePath, DocumentRoot) ->
+    {ok, MochiReq:serve_file(RelativePath, DocumentRoot, server_header())}.
 
 qs_value(Req, Key) ->
     qs_value(Req, Key, undefined).
@@ -312,31 +283,7 @@ path(#httpd{mochi_req=MochiReq}) ->
     MochiReq:get(path).
 
 absolute_uri(#httpd{mochi_req=MochiReq}, Path) ->
-    XHost = couch_config:get("httpd", "x_forwarded_host", "X-Forwarded-Host"),
-    Host = case MochiReq:get_header_value(XHost) of
-        undefined ->
-            case MochiReq:get_header_value("Host") of
-                undefined ->
-                    {ok, {Address, Port}} = inet:sockname(MochiReq:get(socket)),
-                    inet_parse:ntoa(Address) ++ ":" ++ integer_to_list(Port);
-                Value1 ->
-                    Value1
-            end;
-        Value -> Value
-    end,
-    XSsl = couch_config:get("httpd", "x_forwarded_ssl", "X-Forwarded-Ssl"),
-    Scheme = case MochiReq:get_header_value(XSsl) of
-        "on" -> "https";
-        _ ->
-            XProto = couch_config:get("httpd", "x_forwarded_proto",
-                "X-Forwarded-Proto"),
-            case MochiReq:get_header_value(XProto) of
-                % Restrict to "https" and "http" schemes only
-                "https" -> "https";
-                _ -> "http"
-            end
-    end,
-    Scheme ++ "://" ++ Host ++ Path.
+    MochiReq:absolute_uri(Path).
 
 unquote(UrlEncodedString) ->
     mochiweb_util:unquote(UrlEncodedString).
@@ -420,10 +367,10 @@ verify_is_server_admin(#httpd{user_ctx=#user_ctx{roles=Roles}}) ->
     false -> throw({unauthorized, <<"You are not a server admin.">>})
     end.
 
-start_response_length(#httpd{mochi_req=MochiReq}=Req, Code, Headers, Length) ->
+start_response_length(#httpd{mochi_req=MochiReq}, Code, Headers, Length) ->
     couch_stats_collector:increment({httpd_status_codes, Code}),
-    Resp = MochiReq:start_response_length({Code, Headers ++ server_header() ++
-        couch_httpd_auth:cookie_auth_header(Req, Headers), Length}),
+    Resp = MochiReq:start_response_length({Code, Headers ++ server_header(),
+        Length}),
     case MochiReq:get(method) of
     'HEAD' -> throw({http_head_abort, Resp});
     _ -> ok
@@ -434,10 +381,9 @@ send(Resp, Data) ->
     Resp:send(Data),
     {ok, Resp}.
 
-start_chunked_response(#httpd{mochi_req=MochiReq}=Req, Code, Headers) ->
+start_chunked_response(#httpd{mochi_req=MochiReq}, Code, Headers) ->
     couch_stats_collector:increment({httpd_status_codes, Code}),
-    Resp = MochiReq:respond({Code, Headers ++ server_header() ++
-        couch_httpd_auth:cookie_auth_header(Req, Headers), chunked}),
+    Resp = MochiReq:respond({Code, Headers ++ server_header(), chunked}),
     case MochiReq:get(method) of
     'HEAD' -> throw({http_head_abort, Resp});
     _ -> ok
@@ -448,18 +394,13 @@ send_chunk(Resp, Data) ->
     Resp:write_chunk(Data),
     {ok, Resp}.
 
-send_response(#httpd{mochi_req=MochiReq}=Req, Code, Headers, Body) ->
+send_response(#httpd{mochi_req=MochiReq}, Code, Headers, Body) ->
     couch_stats_collector:increment({httpd_status_codes, Code}),
-    if Code >= 400 ->
-        ?LOG_DEBUG("httpd ~p error response:~n ~s", [Code, Body]);
-    true -> ok
-    end,
-    {ok, MochiReq:respond({Code, Headers ++ server_header() ++
-        couch_httpd_auth:cookie_auth_header(Req, Headers), Body})}.
+    {ok, MochiReq:respond({Code, Headers ++ server_header(), Body})}.
 
 send_method_not_allowed(Req, Methods) ->
     send_error(Req, 405, [{"Allow", Methods}], <<"method_not_allowed">>,
-        ?l2b("Only " ++ Methods ++ " allowed")).
+        ?l2b("Only " ++ Methods ++ " allowed"), []).
 
 send_json(Req, Value) ->
     send_json(Req, 200, Value).
@@ -574,15 +515,18 @@ error_info({bad_ctype, Reason}) ->
 error_info(requested_range_not_satisfiable) ->
     {416, <<"requested_range_not_satisfiable">>, <<"Requested range not satisfiable">>};
 error_info({error, illegal_database_name}) ->
-    {400, <<"illegal_database_name">>, <<"Only lowercase characters (a-z), "
-        "digits (0-9), and any of the characters _, $, (, ), +, -, and / "
-        "are allowed">>};
+    {400, <<"illegal_database_name">>, <<"Only lowercase letters (a-z), "
+        "digits (0-9), and any of the characters _, $, (, ), +, -, and / are "
+        "allowed. Moreover, the database name must begin with a letter.">>};
 error_info({missing_stub, Reason}) ->
     {412, <<"missing_stub">>, Reason};
 error_info(not_implemented) ->
     {501, <<"not_implemented">>, <<"this feature is not yet implemented">>};
 error_info({Error, null}) ->
     {500, couch_util:to_binary(Error), null};
+error_info(timeout) ->
+    {500, <<"timeout">>, <<"The request could not be processed in a reasonable"
+        " amount of time.">>};
 error_info({Error, Reason}) ->
     {500, couch_util:to_binary(Error), couch_util:to_binary(Reason)};
 error_info({Error, nil, _Stack}) ->
@@ -634,7 +578,7 @@ error_headers(#httpd{mochi_req=MochiReq}=Req, 401=Code, ErrorStr, ReasonStr) ->
                             end,
                             UrlReturn = ?l2b(couch_util:url_encode(UrlReturnRaw)),
                             UrlReason = ?l2b(couch_util:url_encode(ReasonStr)),
-                            {302, [{"Location", couch_httpd:absolute_uri(Req, <<AuthRedirectBin/binary,"?return=",UrlReturn/binary,"&reason=",UrlReason/binary>>)}]}
+                            {302, [{"Location", absolute_uri(Req, <<AuthRedirectBin/binary,"?return=",UrlReturn/binary,"&reason=",UrlReason/binary>>)}]}
                         end
                     end
                 end;
@@ -687,7 +631,7 @@ send_chunked_error(Resp, Error) ->
     send_chunk(Resp, []).
 
 send_redirect(Req, Path) ->
-     Headers = [{"Location", chttpd:absolute_uri(Req, Path)}],
+     Headers = [{"Location", absolute_uri(Req, Path)}],
      send_response(Req, 301, Headers, <<>>).
 
 server_header() ->
@@ -705,3 +649,75 @@ json_stack({_Error, _Reason, Stack}) ->
     end, Stack);
 json_stack(_) ->
     [].
+
+% chttpd request callbacks
+
+dispatch_request(Req, Path) ->
+    Handler = url_handler(Path),
+    Handler(Req).
+
+log_request(Peer, Host, Method, RawUri, Code, Status, RequestTime) ->
+    Args = [Peer, Host, Method, RawUri, Code, Status, RequestTime],
+    twig:log(info, "~s ~s ~s ~s ~B ~p ~B", Args).
+
+make_uri(Req, Raw) ->
+    Url = list_to_binary(["http://", couch_config:get("httpd", "bind_address"),
+                         ":", couch_config:get("chttpd", "port"), "/", Raw]),
+    Headers = [
+        {<<"authorization">>, ?l2b(header_value(Req,"authorization",""))},
+        {<<"cookie">>, ?l2b(header_value(Req,"cookie",""))}
+    ],
+    {[{<<"url">>,Url}, {<<"headers">>,{Headers}}]}.
+
+admin_roles() ->
+    [<<"_reader">>, <<"_writer">>, <<"_admin">>].
+
+db_info(_Req, Info) ->
+    Info.
+
+default_headers(Req) ->
+    couch_httpd_auth:cookie_auth_header(Req, []).
+
+get_path(#httpd{path_parts=Path}) ->
+    Path.
+
+build_uri(_HttpReq, Scheme, Host, Path) ->
+    Scheme ++ "://" ++ Host ++ Path.
+
+url_handler("") ->              fun chttpd_misc:handle_welcome_req/1;
+url_handler("favicon.ico") ->   fun chttpd_misc:handle_favicon_req/1;
+url_handler("_utils") ->        fun chttpd_misc:handle_utils_dir_req/1;
+url_handler("_all_dbs") ->      fun chttpd_misc:handle_all_dbs_req/1;
+url_handler("_active_tasks") -> fun chttpd_misc:handle_task_status_req/1;
+url_handler("_config") ->       fun chttpd_misc:handle_config_req/1;
+url_handler("_replicate") ->    fun chttpd_misc:handle_replicate_req/1;
+url_handler("_uuids") ->        fun chttpd_misc:handle_uuids_req/1;
+url_handler("_log") ->          fun chttpd_misc:handle_log_req/1;
+url_handler("_sleep") ->        fun chttpd_misc:handle_sleep_req/1;
+url_handler("_session") ->      fun couch_httpd_auth:handle_session_req/1;
+url_handler("_oauth") ->        fun couch_httpd_oauth:handle_oauth_req/1;
+%% showroom_http module missing in bigcouch
+url_handler("_restart") ->      fun showroom_http:handle_restart_req/1;
+url_handler("_system") ->       fun chttpd_misc:handle_system_req/1;
+url_handler("_membership") ->   fun mem3_httpd:handle_membership_req/1;
+url_handler(_) ->               fun chttpd_db:handle_request/1.
+
+db_url_handlers() ->
+    [
+        {<<"_view_cleanup">>,   fun chttpd_db:handle_view_cleanup_req/2},
+        {<<"_compact">>,        fun chttpd_db:handle_compact_req/2},
+        {<<"_design">>,         fun chttpd_db:handle_design_req/2},
+        {<<"_temp_view">>,      fun chttpd_view:handle_temp_view_req/2},
+        {<<"_changes">>,        fun chttpd_db:handle_changes_req/2},
+        {<<"_search">>,         fun chttpd_external:handle_search_req/2}
+    ].
+
+design_url_handlers() ->
+    [
+        {<<"_view">>,           fun chttpd_view:handle_view_req/3},
+        {<<"_show">>,           fun chttpd_show:handle_doc_show_req/3},
+        {<<"_list">>,           fun chttpd_show:handle_view_list_req/3},
+        {<<"_update">>,         fun chttpd_show:handle_doc_update_req/3},
+        {<<"_info">>,           fun chttpd_db:handle_design_info_req/3},
+        {<<"_rewrite">>,        fun chttpd_rewrite:handle_rewrite_req/3}
+    ].

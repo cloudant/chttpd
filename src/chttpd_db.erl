@@ -14,7 +14,7 @@
 -include_lib("couch/include/couch_db.hrl").
 
 -export([handle_request/1, handle_compact_req/2, handle_design_req/2,
-    db_req/2, couch_doc_open/4,handle_changes_req/2,
+    db_req/2, delete_db_req/2, couch_doc_open/4,handle_changes_req/2,
     update_doc_result_to_json/1, update_doc_result_to_json/2,
     handle_design_info_req/3, handle_view_cleanup_req/2]).
 
@@ -198,13 +198,13 @@ do_db_req(#httpd{path_parts=[DbName|_], user_ctx=Ctx}=Req, Fun) ->
     fabric:get_security(DbName, [{user_ctx,Ctx}]), % calls check_is_reader
     Fun(Req, #db{name=DbName, user_ctx=Ctx}).
 
-db_req(#httpd{method='GET',path_parts=[DbName]}=Req, _Db) ->
+db_req(#httpd{mochi_req=MochiReq,method='GET',path_parts=[DbName]}=Req, _Db) ->
     % measure the time required to generate the etag, see if it's worth it
     T0 = now(),
     {ok, DbInfo} = fabric:get_db_info(DbName),
     DeltaT = timer:now_diff(now(), T0) / 1000,
     couch_stats_collector:record({couchdb, dbinfo}, DeltaT),
-    send_json(Req, {DbInfo});
+    send_json(Req, {MochiReq:db_info(DbInfo)});
 
 db_req(#httpd{method='POST', path_parts=[DbName], user_ctx=Ctx}=Req, Db) ->
     couch_httpd:validate_ctype(Req, "application/json"),
@@ -228,7 +228,7 @@ db_req(#httpd{method='POST', path_parts=[DbName], user_ctx=Ctx}=Req, Db) ->
                 {ok, _} -> ok;
                 {accepted, _} -> ok;
                 Error ->
-                    ?LOG_INFO("Batch doc error (~s): ~p",[DocId, Error])
+                    twig:log(debug, "Batch doc error (~s): ~p",[DocId, Error])
                 end
             end),
 
@@ -629,7 +629,8 @@ db_doc_req(#httpd{method='PUT', user_ctx=Ctx}=Req, Db, DocId) ->
                     {ok, _} -> ok;
                     {accepted, _} -> ok;
                     Error ->
-                        ?LOG_INFO("Batch doc error (~s): ~p",[DocId, Error])
+                        twig:log(debug, "Batch doc error (~s): ~p", [DocId,
+                            Error])
                     end
                 end),
             send_json(Req, 202, [], {[
@@ -996,10 +997,8 @@ db_attachment_req(#httpd{method=Method, user_ctx=Ctx}=Req, Db, DocId, FileNamePa
             end
     end,
 
-    #doc{atts=Atts, revs = {Pos, Revs}} = Doc,
+    #doc{atts=Atts} = Doc,
     DocEdited = Doc#doc{
-        % prune revision list as a workaround for key tree bug (COUCHDB-902)
-        revs = {Pos, case Revs of [] -> []; [Hd|_] -> [Hd] end},
         atts = NewAtt ++ [A || A <- Atts, A#att.name /= FileName]
     },
     case fabric:update_doc(Db, DocEdited, [{user_ctx,Ctx}]) of
