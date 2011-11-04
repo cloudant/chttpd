@@ -96,7 +96,7 @@ handle_all_dbs_req(#httpd{method='GET'}=Req) ->
     chttpd:etag_respond(Req, Etag, fun() ->
         {ok, Resp} = chttpd:start_delayed_json_response(Req, 200, [{"Etag",Etag}]),
         fabric:all_docs(ShardDbName, fun all_dbs_callback/2,
-            {nil, Resp}, #view_query_args{})
+            {nil, Resp}, #view_query_args{}, "")
     end);
 handle_all_dbs_req(Req) ->
     send_method_not_allowed(Req, "GET,HEAD").

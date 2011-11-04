@@ -50,6 +50,7 @@ multi_query_view(Req, Db, DDoc, ViewName, Queries) ->
     end).
 
 design_doc_view(Req, Db, DDoc, ViewName, Keys) ->
+    EncShards = chttpd:header_value(Req,"X-Couch-Read-Your-Writes",""),
     Group = couch_view_group:design_doc_to_view_group(DDoc),
     IsReduce = get_reduce_type(Req),
     ViewType = extract_view_type(ViewName, Group#group.views, IsReduce),
@@ -61,7 +62,7 @@ design_doc_view(Req, Db, DDoc, ViewName, Keys) ->
     chttpd:etag_respond(Req, Etag, fun() ->
         {ok, Resp} = chttpd:start_delayed_json_response(Req, 200, [{"Etag",Etag}]),
         CB = fun view_callback/2,
-        {ok, Resp1} = fabric:query_view(Db, DDoc, ViewName, CB, {nil, Resp}, QueryArgs),
+        {ok, Resp1} = fabric:query_view(Db, DDoc, ViewName, CB, {nil, Resp}, QueryArgs, EncShards),
         chttpd:end_delayed_json_response(Resp1)
     end).
 

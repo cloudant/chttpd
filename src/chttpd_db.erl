@@ -225,7 +225,7 @@ db_req(#httpd{method='POST', path_parts=[DbName], user_ctx=Ctx}=Req, Db) ->
         % async_batching
         spawn(fun() ->
                 case catch(fabric:update_doc(Db, Doc2, Options)) of
-                {ok, _} -> ok;
+                {ok, _, _} -> ok;
                 {accepted, _} -> ok;
                 Error ->
                     ?LOG_INFO("Batch doc error (~s): ~p",[DocId, Error])
@@ -240,7 +240,7 @@ db_req(#httpd{method='POST', path_parts=[DbName], user_ctx=Ctx}=Req, Db) ->
         % normal
         DocUrl = absolute_uri(Req, [$/, DbName, $/, DocId]),
         case fabric:update_doc(Db, Doc2, Options) of
-        {ok, NewRev} ->
+        {ok, NewRev, _} ->
             HttpCode = 201;
         {accepted, NewRev} ->
             HttpCode = 202
@@ -304,11 +304,11 @@ db_req(#httpd{method='POST',path_parts=[_,<<"_bulk_docs">>], user_ctx=Ctx}=Req, 
         _ -> Options
         end,
         case fabric:update_docs(Db, Docs, Options2) of
-        {ok, Results} ->
+        {ok, Results, EncShards} ->
             % output the results
             DocResults = lists:zipwith(fun update_doc_result_to_json/2,
                 Docs, Results),
-            send_json(Req, 201, DocResults);
+            send_json(Req, 201, [{"X-Couch-Read-Your-Writes",EncShards}], DocResults);
         {accepted, Results} ->
             % output the results
             DocResults = lists:zipwith(fun update_doc_result_to_json/2,
@@ -323,7 +323,7 @@ db_req(#httpd{method='POST',path_parts=[_,<<"_bulk_docs">>], user_ctx=Ctx}=Req, 
         Docs = [couch_doc:from_json_obj(JsonObj) || JsonObj <- DocsArray],
         [validate_attachment_names(D) || D <- Docs],
         case fabric:update_docs(Db, Docs, [replicated_changes|Options]) of
-        {ok, Errors} ->
+        {ok, Errors, _} ->
             ErrorsJson = lists:map(fun update_doc_result_to_json/1, Errors),
             send_json(Req, 201, ErrorsJson);
         {accepted, Errors} ->
@@ -467,9 +467,10 @@ all_docs_view(Req, Db, Keys) ->
     DeltaT = timer:now_diff(now(), T0) / 1000,
     couch_stats_collector:record({couchdb, dbinfo}, DeltaT),
     QueryArgs = chttpd_view:parse_view_params(Req, Keys, map),
+    EncShards = chttpd:header_value(Req,"X-Couch-Read-Your-Writes",""),
     chttpd:etag_respond(Req, Etag, fun() ->
         {ok, Resp} = chttpd:start_delayed_json_response(Req, 200, [{"Etag",Etag}]),
-        fabric:all_docs(Db, fun all_docs_callback/2, {nil, Resp}, QueryArgs)
+        fabric:all_docs(Db, fun all_docs_callback/2, {nil, Resp}, QueryArgs, EncShards)
     end).
 
 all_docs_callback({total_and_offset, Total, Offset}, {_, Resp}) ->
@@ -582,7 +583,7 @@ db_doc_req(#httpd{method='POST', user_ctx=Ctx}=Req, Db, DocId) ->
         atts = UpdatedAtts ++ OldAtts2
     },
     case fabric:update_doc(Db, NewDoc, Options) of
-    {ok, NewRev} ->
+    {ok, NewRev, _} ->
         HttpCode = 201;
     {accepted, NewRev} ->
         HttpCode = 202
@@ -626,7 +627,7 @@ db_doc_req(#httpd{method='PUT', user_ctx=Ctx}=Req, Db, DocId) ->
 
             spawn(fun() ->
                     case catch(fabric:update_doc(Db, Doc, Options)) of
-                    {ok, _} -> ok;
+                    {ok, _, _} -> ok;
                     {accepted, _} -> ok;
                     Error ->
                         ?LOG_INFO("Batch doc error (~s): ~p",[DocId, Error])
@@ -656,7 +657,7 @@ db_doc_req(#httpd{method='COPY', user_ctx=Ctx}=Req, Db, SourceDocId) ->
     % save new doc
     case fabric:update_doc(Db,
         Doc#doc{id=TargetDocId, revs=TargetRevs}, [{user_ctx,Ctx}]) of
-    {ok, NewTargetRev} ->
+    {ok, NewTargetRev, _} ->
         HttpCode = 201;
     {accepted, NewTargetRev} ->
         HttpCode = 202
@@ -775,14 +776,16 @@ update_doc(#httpd{user_ctx=Ctx} = Req, Db, DocId, #doc{deleted=Deleted}=Doc,
     _ ->
         Options = [UpdateType, {user_ctx,Ctx}, {w,W}]
     end,
-    case fabric:update_doc(Db, Doc, Options) of
-    {ok, NewRev} ->
-        Accepted = false;
-    {accepted, NewRev} ->
-        Accepted = true
-    end,
+    {Accepted, NewRev, EncShards} =
+        case fabric:update_doc(Db, Doc, Options) of
+        {ok, NR, ES} ->
+            {false, NR, ES};
+        {accepted, NR} ->
+            {true, NR, ""}
+        end,
     NewRevStr = couch_doc:rev_to_str(NewRev),
     ResponseHeaders = [{"Etag", <<"\"", NewRevStr/binary, "\"">>} | Headers],
+    NewResponseHeaders = [{"X-Couch-Read-Your-Writes", EncShards} | ResponseHeaders],
     case {Accepted, Deleted} of
     {true, _} ->
         HttpCode = 202;
@@ -791,7 +794,7 @@ update_doc(#httpd{user_ctx=Ctx} = Req, Db, DocId, #doc{deleted=Deleted}=Doc,
     {false, false} ->
         HttpCode = 201
     end,
-    send_json(Req, HttpCode, ResponseHeaders, {[
+    send_json(Req, HttpCode, NewResponseHeaders, {[
         {ok, true},
         {id, DocId},
         {rev, NewRevStr}
@@ -1003,7 +1006,7 @@ db_attachment_req(#httpd{method=Method, user_ctx=Ctx}=Req, Db, DocId, FileNamePa
         atts = NewAtt ++ [A || A <- Atts, A#att.name /= FileName]
     },
     case fabric:update_doc(Db, DocEdited, [{user_ctx,Ctx}]) of
-    {ok, UpdatedRev} ->
+    {ok, UpdatedRev, _} ->
         HttpCode = 201;
     {accepted, UpdatedRev} ->
         HttpCode = 202
