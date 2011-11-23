@@ -26,6 +26,18 @@
     send_chunk/2,
     start_chunked_response/3]).
 
+%% temporary copy, this record should probably go into fabric.hrl
+-record (view_acc, {
+    db,
+    doc_info = nil,
+    offset = nil,
+    total_rows,
+    reduce_fun = fun couch_db:enum_docs_reduce_to_count/1,
+    callback=nil,
+    callback_resp=nil
+
+}).
+
 % httpd global handlers
 
 handle_welcome_req(Req) ->
@@ -89,14 +101,12 @@ handle_sleep_req(Req) ->
 
 handle_all_dbs_req(#httpd{method='GET'}=Req) ->
     ShardDbName = couch_config:get("mem3", "shard_db", "dbs"),
-    %% shard_db is not sharded but mem3:shards treats it as an edge case
-    %% so it can be pushed thru fabric
-    {ok, Info} = fabric:get_db_info(ShardDbName),
+    {ok, Db} = couch_db:open(?l2b(ShardDbName),[]),
+    {ok, Info} = couch_db:get_db_info(Db),
     Etag = couch_httpd:make_etag({Info}),
     chttpd:etag_respond(Req, Etag, fun() ->
         {ok, Resp} = chttpd:start_delayed_json_response(Req, 200, [{"Etag",Etag}]),
-        fabric:all_docs(ShardDbName, fun all_dbs_callback/2,
-            {nil, Resp}, #view_query_args{})
+        all_docs(Db, fun all_dbs_callback/2, {nil, Resp})
     end);
 handle_all_dbs_req(Req) ->
     send_method_not_allowed(Req, "GET,HEAD").
@@ -282,3 +292,71 @@ handle_system_req(Req) ->
         {process_limit, erlang:system_info(process_limit)},
         {message_queue_len, MessageQueueLen}
     ]}).
+
+all_docs(Db, Callback, Resp) ->
+    {ok, Total} = couch_db:get_doc_count(Db),
+    Acc0 = #view_acc{
+        db = Db,
+        total_rows = Total,
+        callback = Callback,
+        callback_resp = Resp
+    },
+    {ok, _, Acc} = couch_db:enum_docs(Db, fun view_fold/3, Acc0, []),
+    final_response(Total, Acc).
+
+
+view_fold(#full_doc_info{} = FullDocInfo, OffsetReds, Acc) ->
+    % matches for _all_docs and translates #full_doc_info{} -> KV pair
+    case couch_doc:to_doc_info(FullDocInfo) of
+    #doc_info{id=Id, revs=[#rev_info{deleted=false, rev=Rev}|_]} = DI ->
+        Value = {[{rev,couch_doc:rev_to_str(Rev)}]},
+        view_fold({{Id,Id}, Value}, OffsetReds, Acc#view_acc{doc_info=DI});
+    #doc_info{revs=[#rev_info{deleted=true}|_]} ->
+        {ok, Acc}
+    end;
+view_fold(KV, OffsetReds, #view_acc{offset=nil, total_rows=Total} = Acc) ->
+    % calculates the offset for this shard
+    #view_acc{callback = CallbackFun,
+              callback_resp = Resp,
+              reduce_fun=Reduce} = Acc,
+    Offset = Reduce(OffsetReds),
+    case CallbackFun({total_and_offset, Total, Offset}, Resp) of
+    {ok, Resp1} ->
+        view_fold(KV, OffsetReds, Acc#view_acc{offset=Offset, callback_resp=Resp1});
+    stop ->
+        exit(normal);
+    timeout ->
+        exit(timeout)
+    end;
+view_fold({{_,Id}, _}, _Offset, Acc) ->
+    % the normal case
+    #view_acc{
+        callback = CallbackFun,
+        callback_resp = Resp
+    } = Acc,
+
+    case CallbackFun({row, {[{id,Id}]}}, Resp) of
+    {ok, Resp1} ->
+        {ok, Acc#view_acc{callback_resp=Resp1}};
+    timeout ->
+            exit(timeout)
+    end.
+
+final_response(Total, Acc) ->
+    #view_acc{
+        offset = Offset,
+        callback = CallbackFun,
+        callback_resp = Resp} = Acc,
+    case Offset of
+    nil ->
+        case CallbackFun({total_and_offset, Total, Total}, Resp) of
+        {ok, Resp1} ->
+            CallbackFun(complete, Resp1);
+        stop ->
+            ok;
+        timeout ->
+            exit(timeout)
+        end;
+    _ ->
+        CallbackFun(complete, Resp)
+    end.
