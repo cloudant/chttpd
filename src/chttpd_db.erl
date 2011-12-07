@@ -14,7 +14,7 @@
 -include_lib("couch/include/couch_db.hrl").
 
 -export([handle_request/1, handle_compact_req/2, handle_design_req/2,
-    db_req/2, couch_doc_open/4,handle_changes_req/2,
+    db_req/2, couch_doc_open/4,handle_changes_req/2, parse_changes_query/1,
     update_doc_result_to_json/1, update_doc_result_to_json/2,
     handle_design_info_req/3, handle_view_cleanup_req/2]).
 

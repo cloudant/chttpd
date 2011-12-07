@@ -16,7 +16,8 @@
     handle_all_dbs_req/1,handle_replicate_req/1,handle_restart_req/1,
     handle_uuids_req/1,handle_config_req/1,handle_log_req/1,
     handle_task_status_req/1,handle_sleep_req/1,handle_welcome_req/1,
-    handle_utils_dir_req/1, handle_favicon_req/1, handle_system_req/1]).
+    handle_utils_dir_req/1, handle_favicon_req/1, handle_system_req/1,
+    handle_db_changes_req/1]).
 
 
 -include_lib("couch/include/couch_db.hrl").
@@ -85,6 +86,13 @@ handle_sleep_req(#httpd{method='GET'}=Req) ->
     send_json(Req, {[{ok, true}]});
 handle_sleep_req(Req) ->
     send_method_not_allowed(Req, "GET,HEAD").
+
+% expose a changes feed for the shard_db
+handle_db_changes_req(#httpd{method='GET'}=Req) ->
+    %% get shard_db db
+    ShardDbName = couch_config:get("mem3", "shard_db", "dbs"),
+    {ok, Db} = couch_db:open(?l2b(ShardDbName),[]),
+    couch_httpd_db:handle_changes_req1(Req, Db).
 
 handle_all_dbs_req(#httpd{method='GET'}=Req) ->
     ShardDbName = couch_config:get("mem3", "shard_db", "dbs"),
