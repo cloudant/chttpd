@@ -1153,6 +1153,8 @@ parse_changes_query(Req) ->
             Args#changes_args{dir=rev};
         {"since", _} ->
             Args#changes_args{since=Value};
+        {"until", _} ->
+            Args#changes_args{until=Value};
         {"limit", _} ->
             Args#changes_args{limit=list_to_integer(Value)};
         {"style", _} ->
