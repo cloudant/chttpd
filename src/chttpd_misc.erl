@@ -125,6 +125,7 @@ handle_task_status_req(#httpd{method='GET'}=Req) ->
 handle_task_status_req(Req) ->
     send_method_not_allowed(Req, "GET,HEAD").
 
+%% NOTE:This should be handed off to couch_replicator_httpd:handle_req
 handle_replicate_req(#httpd{method='POST', user_ctx=Ctx} = Req) ->
     couch_httpd:validate_ctype(Req, "application/json"),
     %% see HACK in chttpd.erl about replication
@@ -164,7 +165,6 @@ replicate({Props} = PostBody, Ctx) ->
         couch_util:get_value(<<"target">>, Props)
     ]),
     {ok, Rep} = couch_replicator_utils:parse_rep_doc(PostBody, Ctx),
-    io:format("chttpd misc replicate with: ~p on node ~p ~n",[Rep, Node]),
     case rpc:call(node(), couch_replicator, replicate, [Rep]) of
     {badrpc, Reason} ->
         erlang:error(Reason);
