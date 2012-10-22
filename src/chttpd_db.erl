@@ -218,7 +218,18 @@ db_req(#httpd{method='POST', path_parts=[DbName], user_ctx=Ctx}=Req, Db) ->
     Doc = couch_doc:from_json_obj(couch_httpd:json_body(Req)),
     Doc2 = case Doc#doc.id of
         <<"">> ->
-            Doc#doc{id=couch_uuids:new(), revs={0, []}};
+            % request an id from mem3 which is a per db configuration
+            {Type, HashId} = mem3_util:hash(DbName, Doc),
+            case Type of 
+            default ->
+                Doc#doc{id=couch_uuids:new(), revs={0, []}};
+            _ ->
+                % composite hash
+                Id = couch_uuids:new(),
+                NS = atom_to_binary(Type, latin1), 
+                Hash = ?l2b(integer_to_list(HashId)),
+                Doc#doc{id = <<NS/binary, ":", Id/binary, "-", Hash/binary>>}
+            end;
         _ ->
             Doc
     end,
