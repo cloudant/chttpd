@@ -262,7 +262,7 @@ handle_system_req(Req) ->
     Other = erlang:memory(system) - lists:sum([X || {_,X} <-
         erlang:memory([atom, code, binary, ets])]),
     Memory = [{other, Other} | erlang:memory([atom, atom_used, processes,
-        processes_used, binary, code, ets])],
+        processes_used, binary, code, ets, total])],
     {NumberOfGCs, WordsReclaimed, _} = statistics(garbage_collection),
     {{input, Input}, {output, Output}} = statistics(io),
     {message_queue_len, MessageQueueLen} = process_info(whereis(couch_server),
